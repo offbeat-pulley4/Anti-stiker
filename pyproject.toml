@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "antistiker"
+version = "0.1.0"
+description = "Detects and neutralizes kill-sticker .tgs files before AyuGram renders them"
+requires-python = ">=3.10"
+
+[project.scripts]
+antistiker = "antistiker.__main__:main"
+
+[tool.setuptools]
+packages = ["antistiker"]

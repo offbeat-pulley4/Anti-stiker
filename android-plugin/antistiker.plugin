@@ -1,0 +1,330 @@
+# MIT License
+#
+# Anti-Stiker for AyuGram4A / exteraGram
+#
+# Blocks the "kill sticker" crash: a .tgs (gzipped Lottie) animation with a
+# hostile value in a field rlottie trusts blindly -- e.g. a polystar point
+# count of 1e38 -- which the native renderer casts to size_t (undefined
+# behavior -> effectively SIZE_MAX) and then tries to allocate memory for,
+# OOM-killing the process. Traced in AyuGram4A's own vendored rlottie:
+#   TMessagesProj/jni/rlottie/src/vector/vpath.cpp, addPolystar()/addPolygon()
+#   fed by TMessagesProj/jni/rlottie/src/lottie/lottieitem.cpp:1272
+#
+# Every one of those paths -- constructing an RLottieDrawable from a
+# downloaded sticker file -- goes through org.telegram.ui.Components.
+# RLottieDrawable's File/json constructors before the native create() call.
+# This plugin hooks all of them, validates the animation the same way a
+# renderer would (but never renders it), and swaps in a harmless placeholder
+# if it matches a known crash pattern -- so the native parser never sees the
+# attacker's payload at all.
+
+import gzip
+import io
+import json
+import math
+import os
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java.io import File as JFile
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch
+
+__id__ = "antistiker"
+__name__ = "Anti-Stiker"
+__description__ = "Blocks 'kill sticker' .tgs crashes before rlottie ever sees them"
+__author__ = "@offbeat-pulley4"
+__version__ = "1.0.0"
+__min_version__ = "11.9.1"
+
+# ---------------------------------------------------------------------------
+# Validation. Same thresholds/logic as antistiker/tgs_scan.py in this repo,
+# trimmed to a single boolean verdict since this runs on the hot path of
+# every sticker/emoji draw call and has to stay fast.
+# ---------------------------------------------------------------------------
+MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024
+MAX_VISITED_NODES = 200_000
+MAX_LAYERS = 500
+MAX_ASSETS = 500
+MAX_KEYFRAMES_PER_PROPERTY = 4_000
+MAX_PRECOMP_DEPTH = 24
+MAX_NUMBER_MAGNITUDE = 1e6
+MAX_POLYSTAR_POINTS = 1_000
+MAX_RADIUS_MAGNITUDE = 1e5
+
+SAFE_PLACEHOLDER_JSON = (
+    '{"v":"5.7.4","fr":30,"ip":0,"op":1,"w":512,"h":512,'
+    '"nm":"blocked-by-antistiker","ddd":0,"assets":[],"layers":[]}'
+)
+
+
+class Rejected(Exception):
+    pass
+
+
+def _reject_constant(token):
+    raise Rejected(f"non-finite literal '{token}' in JSON")
+
+
+def _decompress(raw: bytes) -> bytes:
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+            chunks = []
+            total = 0
+            while True:
+                chunk = gz.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DECOMPRESSED_BYTES:
+                    raise Rejected("decompressed payload too large (gzip bomb)")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except OSError as exc:
+        raise Rejected(f"not a valid gzip stream: {exc}") from exc
+
+
+def _iter_numbers(value):
+    if isinstance(value, bool):
+        return
+    if isinstance(value, (int, float)):
+        yield float(value)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_numbers(item)
+    elif isinstance(value, dict):
+        for key in ("s", "e", "k"):
+            if key in value:
+                yield from _iter_numbers(value[key])
+
+
+def _prop_numbers(node: dict, key: str):
+    prop = node.get(key)
+    if prop is None:
+        return
+    yield from _iter_numbers(prop.get("k") if isinstance(prop, dict) else prop)
+
+
+def _asset_graph(doc: dict):
+    graph = {}
+
+    def refs_in_layers(layers):
+        out = set()
+        if isinstance(layers, list):
+            for layer in layers:
+                if isinstance(layer, dict) and layer.get("ty") == 0:
+                    ref = layer.get("refId")
+                    if isinstance(ref, str):
+                        out.add(ref)
+        return out
+
+    for asset in doc.get("assets") or []:
+        if isinstance(asset, dict) and isinstance(asset.get("id"), str):
+            graph[asset["id"]] = refs_in_layers(asset.get("layers"))
+    graph["$root"] = refs_in_layers(doc.get("layers"))
+    return graph
+
+
+def _has_bad_precomp_graph(doc: dict) -> bool:
+    graph = _asset_graph(doc)
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in graph}
+
+    def dfs(node, depth):
+        if depth > MAX_PRECOMP_DEPTH:
+            return True
+        color[node] = GRAY
+        for neighbor in graph.get(node, ()):
+            if neighbor not in graph:
+                continue
+            if color[neighbor] == GRAY:
+                return True
+            if color[neighbor] == WHITE and dfs(neighbor, depth + 1):
+                return True
+        color[node] = BLACK
+        return False
+
+    return any(color[n] == WHITE and dfs(n, 0) for n in list(graph))
+
+
+def _validate_doc(doc) -> str | None:
+    """Returns None if safe, else a short reason string."""
+    if not isinstance(doc, dict):
+        return "top-level JSON value is not an object"
+
+    for key in ("w", "h", "fr", "ip", "op"):
+        val = doc.get(key)
+        if val is not None:
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                return f"top-level '{key}' is not numeric"
+            if not math.isfinite(val) or abs(val) > MAX_NUMBER_MAGNITUDE:
+                return f"top-level '{key}' out of range"
+
+    layers = doc.get("layers")
+    if isinstance(layers, list) and len(layers) > MAX_LAYERS:
+        return f"{len(layers)} top-level layers exceeds safe limit"
+    assets = doc.get("assets")
+    if isinstance(assets, list) and len(assets) > MAX_ASSETS:
+        return f"{len(assets)} assets exceeds safe limit"
+
+    visited = 0
+    stack = [doc]
+    while stack:
+        node = stack.pop()
+        visited += 1
+        if visited > MAX_VISITED_NODES:
+            return "document too complex to safely analyze"
+
+        if isinstance(node, dict):
+            if node.get("ty") == "sr":
+                for key, bound in (("pt", MAX_POLYSTAR_POINTS), ("ir", MAX_RADIUS_MAGNITUDE),
+                                    ("or", MAX_RADIUS_MAGNITUDE)):
+                    for num in _prop_numbers(node, key):
+                        if not math.isfinite(num) or abs(num) > bound:
+                            return f"polystar '{key}' = {num!r} out of bounds"
+
+            for key, value in node.items():
+                if isinstance(value, dict) and ("k" in value or "s" in value or "e" in value):
+                    for num in _iter_numbers(value):
+                        if not math.isfinite(num):
+                            return f"field '{key}' is non-finite"
+                        if abs(num) > MAX_NUMBER_MAGNITUDE:
+                            return f"field '{key}' = {num!r} absurdly large"
+                if isinstance(value, dict) and value.get("a") == 1:
+                    k = value.get("k")
+                    if isinstance(k, list) and len(k) > MAX_KEYFRAMES_PER_PROPERTY:
+                        return f"property '{key}' has too many keyframes"
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            if len(node) > MAX_LAYERS * 4:
+                return "array too large"
+            stack.extend(item for item in node if isinstance(item, (dict, list)))
+
+    if _has_bad_precomp_graph(doc):
+        return "circular/too-deep precomposition reference"
+
+    return None
+
+
+def check_tgs_bytes(raw: bytes) -> str | None:
+    try:
+        payload = _decompress(raw)
+        doc = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
+    except Rejected as exc:
+        return str(exc)
+    except Exception as exc:  # malformed gzip/utf-8/json -- treat as hostile, not our bug
+        return f"unparseable: {exc}"
+    return _validate_doc(doc)
+
+
+def check_json_text(text: str) -> str | None:
+    try:
+        doc = json.loads(text, parse_constant=_reject_constant)
+    except Rejected as exc:
+        return str(exc)
+    except Exception as exc:
+        return f"unparseable: {exc}"
+    return _validate_doc(doc)
+
+
+# ---------------------------------------------------------------------------
+# Plugin
+# ---------------------------------------------------------------------------
+
+class BlockKillStickerHook(MethodHook):
+    def __init__(self, plugin: "AntiStikerPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            for i in range(len(args)):
+                arg = args[i]
+                if arg is None:
+                    continue
+
+                if isinstance(arg, JFile):
+                    path = str(arg.getAbsolutePath())
+                    if not path.lower().endswith(".tgs"):
+                        continue
+                    try:
+                        with open(path, "rb") as f:
+                            raw = f.read()
+                    except OSError:
+                        continue
+                    reason = check_tgs_bytes(raw)
+                    if reason:
+                        log(f"[Anti-Stiker] blocked {path}: {reason}")
+                        args[i] = JFile(self.plugin.placeholder_path)
+                        self.plugin.notify_blocked(reason)
+
+                elif isinstance(arg, str) and '"layers"' in arg and arg.strip().startswith("{"):
+                    reason = check_json_text(arg)
+                    if reason:
+                        log(f"[Anti-Stiker] blocked inline animation: {reason}")
+                        args[i] = SAFE_PLACEHOLDER_JSON
+                        self.plugin.notify_blocked(reason)
+        except Exception as exc:
+            # Never let our own bug crash the thing we're trying to protect.
+            log(f"[Anti-Stiker] hook error (allowing original call through): {exc}")
+
+
+class AntiStikerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.placeholder_path = None
+        self._unhooks = None
+
+    def create_settings(self):
+        return [
+            Header(text="Anti-Stiker"),
+            Switch(
+                key="notify",
+                text="Notify when a sticker is blocked",
+                default=True,
+                subtext="Shows a bulletin when a malicious .tgs is neutralized",
+            ),
+        ]
+
+    def on_plugin_load(self):
+        try:
+            from file_utils import get_files_dir
+            self.placeholder_path = os.path.join(get_files_dir(), "antistiker_safe_placeholder.tgs")
+            if not os.path.exists(self.placeholder_path):
+                buf = io.BytesIO()
+                with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+                    gz.write(SAFE_PLACEHOLDER_JSON.encode("utf-8"))
+                with open(self.placeholder_path, "wb") as f:
+                    f.write(buf.getvalue())
+        except Exception as exc:
+            log(f"[Anti-Stiker] could not prepare placeholder, disabling: {exc}")
+            return
+
+        cls = find_class("org.telegram.ui.Components.RLottieDrawable")
+        if cls is None:
+            log("[Anti-Stiker] could not find RLottieDrawable -- client internals changed?")
+            return
+
+        self._unhooks = self.hook_all_constructors(cls, BlockKillStickerHook(self))
+        log("[Anti-Stiker] loaded, watching RLottieDrawable constructors")
+
+    def on_plugin_unload(self):
+        if self._unhooks:
+            for unhook in self._unhooks:
+                try:
+                    self.unhook_method(unhook)
+                except Exception:
+                    pass
+            self._unhooks = None
+
+    def notify_blocked(self, reason: str):
+        if not self.get_setting("notify", True):
+            return
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(
+                f"Anti-Stiker: blocked a malicious sticker ({reason})"
+            ))
+        except Exception:
+            pass

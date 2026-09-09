@@ -1,0 +1,23 @@
+diff --git a/TMessagesProj/jni/rlottie/src/lottie/lottieitem.cpp b/TMessagesProj/jni/rlottie/src/lottie/lottieitem.cpp
+index 3221c246..8507370a 100644
+--- a/TMessagesProj/jni/rlottie/src/lottie/lottieitem.cpp
++++ b/TMessagesProj/jni/rlottie/src/lottie/lottieitem.cpp
+@@ -1276,6 +1276,18 @@ void LOTPolystarItem::updatePath(VPath &path, int frameNo)
+     float   outerRoundness = mData->mOuterRoundness.value(frameNo);
+     float   rotation = mData->mRotation.value(frameNo);
+ 
++    // "pt"/"ir"/"or" come straight from untrusted sticker JSON. addPolystar()
++    // casts points to size_t and reserves memory proportional to it, so a
++    // hostile value (e.g. 1e38) is undefined behaviour there and crashes or
++    // OOMs the process (the "kill sticker" pattern). Clamp here, at the one
++    // place every polystar/polygon path is built, instead of trusting input.
++    if (!std::isfinite(points) || points < 3.0f) points = 3.0f;
++    if (points > 1000.0f) points = 1000.0f;
++    if (!std::isfinite(innerRadius)) innerRadius = 0.0f;
++    innerRadius = std::min(std::max(innerRadius, -1e5f), 1e5f);
++    if (!std::isfinite(outerRadius)) outerRadius = 0.0f;
++    outerRadius = std::min(std::max(outerRadius, -1e5f), 1e5f);
++
+     path.reset();
+     VMatrix m;
+ 
