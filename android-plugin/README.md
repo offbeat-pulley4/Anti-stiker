@@ -77,6 +77,17 @@ kill_sticker.tgs` before trusting it as your only line of defense, and
 keep an eye on the log line it prints (`[Anti-Stiker] loaded, watching
 RLottieDrawable constructors`) to confirm the hook actually attached.
 
+That gap already caught one real bug: v1.2.0 resolved the target class via
+`hook_utils.find_class()` and passed it straight to `hook_all_constructors`,
+which crashed on enable with `AttributeError: type object 'RLottieDrawable'
+has no attribute 'getName'` -- `find_class()` returns Chaquopy's own class
+proxy, not the `java.lang.Class` reflection object `hook_all_constructors`
+actually needs (it calls `.getName()` on it). v1.3.0 switched to
+`jclass(name).getClass()`, the same pattern `premium.plugin` uses, and the
+test stubs (`tests/stubs/`) now model that distinction and call `.getName()`
+the same way, so a regression here fails a test instead of only showing up
+as "plugin won't enable" on a real device.
+
 ## Tests
 
 ```sh

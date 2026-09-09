@@ -26,14 +26,14 @@ import os
 
 from android_utils import log
 from base_plugin import BasePlugin, MethodHook
-from hook_utils import find_class
+from java import jclass
 from java.io import File as JFile
 
 __id__ = "antistiker"
 __name__ = "Anti-Stiker"
 __description__ = "Blocks 'kill sticker' .tgs crashes before rlottie ever sees them"
 __author__ = "@offbeat-pulley4"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __min_version__ = "11.9.1"
 
 # ---------------------------------------------------------------------------
@@ -298,9 +298,15 @@ class AntiStikerPlugin(BasePlugin):
             log(f"[Anti-Stiker] could not prepare placeholder, disabling: {exc}")
             return
 
-        cls = find_class("org.telegram.ui.Components.RLottieDrawable")
-        if cls is None:
-            log("[Anti-Stiker] could not find RLottieDrawable -- client internals changed?")
+        try:
+            # hook_all_constructors needs an actual java.lang.Class (it calls
+            # .getName() on it) -- jclass(...) alone returns Chaquopy's own
+            # static class proxy, which doesn't have that. .getClass() is
+            # what gets you the real reflection object; see e.g. premium.plugin
+            # in The-MoonTg-project/extera-plugins for the same pattern.
+            cls = jclass("org.telegram.ui.Components.RLottieDrawable").getClass()
+        except Exception as exc:
+            log(f"[Anti-Stiker] could not find RLottieDrawable -- client internals changed? ({exc})")
             return
 
         self._unhooks = self.hook_all_constructors(cls, BlockKillStickerHook(self))
