@@ -10,8 +10,11 @@ A real in-app plugin that blocks the "kill sticker" crash before it happens
    from [exteraStore](https://exterastore.app/plugins) or a `.plugin` file
    someone sent you.
 2. Tap **Install**, then **Enable after installation**.
-3. Optional: in the plugin's settings, toggle whether you want a bulletin
-   notification every time it blocks something (on by default).
+3. It blocks silently by default. If you want a bulletin the first time
+   each malicious file gets neutralized, turn on "Notify when a sticker is
+   blocked" in the plugin's settings — it only fires once per file (view
+   recycling/scrolling rebuilds the same drawable repeatedly, so without
+   dedup this would fire on every rebuild).
 
 Requires client version 11.9.1+ (same floor as other exteraGram/AyuGram
 plugins).

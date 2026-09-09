@@ -72,6 +72,36 @@ def test_hook_ignores_non_tgs_file_args():
     assert param.args[0].getAbsolutePath() == "/tmp/something.png"
 
 
+def test_notifications_off_by_default():
+    p = plugin.AntiStikerPlugin()
+    p.on_plugin_load()
+    plugin.BulletinHelper.calls.clear()
+
+    hook = plugin.BlockKillStickerHook(p)
+    kill_path = os.path.join(FIXTURES, "kill_sticker.tgs")
+    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
+
+    assert plugin.BulletinHelper.calls == []
+
+
+def test_notification_deduped_per_path_when_enabled():
+    p = plugin.AntiStikerPlugin()
+    p.on_plugin_load()
+    p.get_setting = lambda key, default=None: True  # force notifications on
+    plugin.BulletinHelper.calls.clear()
+
+    hook = plugin.BlockKillStickerHook(p)
+    kill_path = os.path.join(FIXTURES, "kill_sticker.tgs")
+
+    # RLottieDrawable gets rebuilt repeatedly for the same on-disk file
+    # (view recycling / scrolling) -- the same file should only bulletin once.
+    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
+    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
+    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
+
+    assert len(plugin.BulletinHelper.calls) == 1
+
+
 def test_hook_swaps_malicious_inline_json_arg():
     p = plugin.AntiStikerPlugin()
     p.on_plugin_load()

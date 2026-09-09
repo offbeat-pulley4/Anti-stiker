@@ -35,7 +35,7 @@ __id__ = "antistiker"
 __name__ = "Anti-Stiker"
 __description__ = "Blocks 'kill sticker' .tgs crashes before rlottie ever sees them"
 __author__ = "@offbeat-pulley4"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __min_version__ = "11.9.1"
 
 # ---------------------------------------------------------------------------
@@ -258,14 +258,14 @@ class BlockKillStickerHook(MethodHook):
                     if reason:
                         log(f"[Anti-Stiker] blocked {path}: {reason}")
                         args[i] = JFile(self.plugin.placeholder_path)
-                        self.plugin.notify_blocked(reason)
+                        self.plugin.notify_blocked(reason, key=path)
 
                 elif isinstance(arg, str) and '"layers"' in arg and arg.strip().startswith("{"):
                     reason = check_json_text(arg)
                     if reason:
                         log(f"[Anti-Stiker] blocked inline animation: {reason}")
                         args[i] = SAFE_PLACEHOLDER_JSON
-                        self.plugin.notify_blocked(reason)
+                        self.plugin.notify_blocked(reason, key=f"inline:{hash(arg)}")
         except Exception as exc:
             # Never let our own bug crash the thing we're trying to protect.
             log(f"[Anti-Stiker] hook error (allowing original call through): {exc}")
@@ -276,6 +276,7 @@ class AntiStikerPlugin(BasePlugin):
         super().__init__()
         self.placeholder_path = None
         self._unhooks = None
+        self._notified_keys = set()
 
     def create_settings(self):
         return [
@@ -283,8 +284,10 @@ class AntiStikerPlugin(BasePlugin):
             Switch(
                 key="notify",
                 text="Notify when a sticker is blocked",
-                default=True,
-                subtext="Shows a bulletin when a malicious .tgs is neutralized",
+                default=False,
+                subtext="Shows a one-time bulletin the first time each malicious "
+                        ".tgs is neutralized. Off by default -- blocking still "
+                        "happens silently either way.",
             ),
         ]
 
@@ -319,9 +322,16 @@ class AntiStikerPlugin(BasePlugin):
                     pass
             self._unhooks = None
 
-    def notify_blocked(self, reason: str):
-        if not self.get_setting("notify", True):
+    def notify_blocked(self, reason: str, key: str | None = None):
+        if not self.get_setting("notify", False):
             return
+        # RLottieDrawable gets reconstructed constantly for the same file
+        # (view recycling, scrolling, cache refreshes) -- without this,
+        # blocking the same sticker once would bulletin on every rebuild.
+        if key is not None:
+            if key in self._notified_keys:
+                return
+            self._notified_keys.add(key)
         try:
             run_on_ui_thread(lambda: BulletinHelper.show_error(
                 f"Anti-Stiker: blocked a malicious sticker ({reason})"
