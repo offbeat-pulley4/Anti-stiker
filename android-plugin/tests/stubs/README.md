@@ -1,7 +1,7 @@
 Minimal fakes of the real exteraGram/AyuGram4A plugin SDK modules
-(`android_utils`, `base_plugin`, `hook_utils`, `file_utils`, `java.io`,
-`ui.bulletin`, `ui.settings`), shaped to match the official type stubs
-published as `exteragram-utils` on PyPI.
+(`android_utils`, `base_plugin`, `hook_utils`, `file_utils`, `java.io`),
+shaped to match the official type stubs published as `exteragram-utils`
+on PyPI.
 
 These exist so `../antistiker.plugin`'s validation/hook logic can be
 exercised by plain pytest, without a real Android device or the (closed

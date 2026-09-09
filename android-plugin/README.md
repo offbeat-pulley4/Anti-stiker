@@ -10,11 +10,10 @@ A real in-app plugin that blocks the "kill sticker" crash before it happens
    from [exteraStore](https://exterastore.app/plugins) or a `.plugin` file
    someone sent you.
 2. Tap **Install**, then **Enable after installation**.
-3. It blocks silently by default. If you want a bulletin the first time
-   each malicious file gets neutralized, turn on "Notify when a sticker is
-   blocked" in the plugin's settings — it only fires once per file (view
-   recycling/scrolling rebuilds the same drawable repeatedly, so without
-   dedup this would fire on every rebuild).
+
+That's it — it runs silently. It doesn't show any notifications; if you
+want to confirm it's active, check the log line it prints on load (see
+"Honesty" below).
 
 Requires client version 11.9.1+ (same floor as other exteraGram/AyuGram
 plugins).
@@ -35,7 +34,20 @@ argument for a tiny inert placeholder animation *before* the original
 constructor runs — so the native parser that actually crashes never sees
 the attacker's bytes at all. The original file itself is left untouched on
 disk; only the in-memory argument going into that one constructor call is
-replaced. A bulletin notification tells you it happened.
+replaced. This happens silently, with a line in the plugin log
+(`[Anti-Stiker] blocked <path>: <reason>`) but no on-screen notification —
+`RLottieDrawable` gets reconstructed constantly during normal use (view
+recycling, scrolling), so a visible bulletin for the same file would fire
+repeatedly and get noisy fast.
+
+It only ever swaps a file when it successfully parsed it and found a
+specific hostile value (an out-of-bounds polystar point count, a
+circular precomposition reference, a decompressed-size bomb, ...). A file
+it can't read or parse at all is left completely alone: `RLottieDrawable`
+can be constructed before `FileLoader` finishes writing the download to
+disk, and an unreadable file at that point is far more likely to be a race
+with an in-flight download than an actual attack — a real kill sticker is
+a syntactically valid gzip+JSON file, only the values inside are hostile.
 
 This is a "before" hook (`MethodHook.before_hooked_method`), the same
 Xposed-style API `hook_method`/`hook_all_constructors` other exteraGram

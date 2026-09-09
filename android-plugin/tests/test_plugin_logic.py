@@ -72,34 +72,39 @@ def test_hook_ignores_non_tgs_file_args():
     assert param.args[0].getAbsolutePath() == "/tmp/something.png"
 
 
-def test_notifications_off_by_default():
+def test_truncated_or_empty_file_is_inconclusive_not_blocked():
+    # RLottieDrawable can be constructed before FileLoader finishes writing
+    # the file to disk. A partially-written/empty file must NOT be treated
+    # as malicious -- that would silently replace legitimate stickers.
+    assert plugin.check_tgs_bytes(b"") is None
+    assert plugin.check_tgs_bytes(b"not gzip at all") is None
+    # a truncated gzip stream (valid header, cut off mid-payload)
+    good = open(os.path.join(FIXTURES, "safe_sticker.tgs"), "rb").read()
+    assert plugin.check_tgs_bytes(good[: len(good) // 2]) is None
+
+
+def test_hook_leaves_unreadable_file_arg_untouched():
     p = plugin.AntiStikerPlugin()
     p.on_plugin_load()
-    plugin.BulletinHelper.calls.clear()
 
-    hook = plugin.BlockKillStickerHook(p)
-    kill_path = os.path.join(FIXTURES, "kill_sticker.tgs")
-    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
+    partial_path = os.path.join(FIXTURES, "_partial_download.tgs")
+    with open(partial_path, "wb") as f:
+        f.write(b"")  # simulates FileLoader having created but not yet written the file
+    try:
+        hook = plugin.BlockKillStickerHook(p)
+        param = FakeParam([JFile(partial_path), 512, 512])
+        hook.before_hooked_method(param)
+        assert param.args[0].getAbsolutePath() == partial_path
+    finally:
+        os.remove(partial_path)
 
-    assert plugin.BulletinHelper.calls == []
 
-
-def test_notification_deduped_per_path_when_enabled():
-    p = plugin.AntiStikerPlugin()
-    p.on_plugin_load()
-    p.get_setting = lambda key, default=None: True  # force notifications on
-    plugin.BulletinHelper.calls.clear()
-
-    hook = plugin.BlockKillStickerHook(p)
-    kill_path = os.path.join(FIXTURES, "kill_sticker.tgs")
-
-    # RLottieDrawable gets rebuilt repeatedly for the same on-disk file
-    # (view recycling / scrolling) -- the same file should only bulletin once.
-    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
-    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
-    hook.before_hooked_method(FakeParam([JFile(kill_path), 512, 512]))
-
-    assert len(plugin.BulletinHelper.calls) == 1
+def test_gzip_bomb_is_still_blocked():
+    huge_json = b'{"pad":"' + b"0" * (9 * 1024 * 1024) + b'"}'
+    buf = __import__("io").BytesIO()
+    with __import__("gzip").GzipFile(fileobj=buf, mode="wb") as gz:
+        gz.write(huge_json)
+    assert plugin.check_tgs_bytes(buf.getvalue()) is not None
 
 
 def test_hook_swaps_malicious_inline_json_arg():

@@ -24,18 +24,16 @@ import json
 import math
 import os
 
-from android_utils import log, run_on_ui_thread
+from android_utils import log
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class
 from java.io import File as JFile
-from ui.bulletin import BulletinHelper
-from ui.settings import Header, Switch
 
 __id__ = "antistiker"
 __name__ = "Anti-Stiker"
 __description__ = "Blocks 'kill sticker' .tgs crashes before rlottie ever sees them"
 __author__ = "@offbeat-pulley4"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __min_version__ = "11.9.1"
 
 # ---------------------------------------------------------------------------
@@ -59,30 +57,38 @@ SAFE_PLACEHOLDER_JSON = (
 )
 
 
-class Rejected(Exception):
-    pass
+class TooLarge(Exception):
+    """A genuine gzip bomb -- unambiguous, unlike a truncated/in-flight file."""
+
+
+class NonFinite(Exception):
+    """A NaN/Infinity literal in the JSON -- unambiguous, not a partial read."""
 
 
 def _reject_constant(token):
-    raise Rejected(f"non-finite literal '{token}' in JSON")
+    raise NonFinite(f"non-finite literal '{token}' in JSON")
 
 
 def _decompress(raw: bytes) -> bytes:
-    try:
-        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
-            chunks = []
-            total = 0
-            while True:
-                chunk = gz.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > MAX_DECOMPRESSED_BYTES:
-                    raise Rejected("decompressed payload too large (gzip bomb)")
-                chunks.append(chunk)
-            return b"".join(chunks)
-    except OSError as exc:
-        raise Rejected(f"not a valid gzip stream: {exc}") from exc
+    # Anything else here (BadGzipFile, EOFError on a truncated stream, ...)
+    # is left to propagate and is treated as inconclusive by the caller --
+    # RLottieDrawable gets constructed the instant FileLoader hands back a
+    # File reference, which can be before the download has actually
+    # finished writing, so an unreadable/incomplete file here is far more
+    # often a race than an attack. A real kill sticker is a syntactically
+    # valid gzip+JSON file; only the values inside it are hostile.
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+        chunks = []
+        total = 0
+        while True:
+            chunk = gz.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_DECOMPRESSED_BYTES:
+                raise TooLarge(f"decompressed payload exceeds {MAX_DECOMPRESSED_BYTES} bytes (gzip bomb)")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def _iter_numbers(value):
@@ -209,23 +215,26 @@ def _validate_doc(doc) -> str | None:
 
 
 def check_tgs_bytes(raw: bytes) -> str | None:
+    """Returns a reason string only for an unambiguous kill-sticker pattern.
+    Anything merely unreadable/unparseable (truncated download, wrong file,
+    ...) returns None -- inconclusive, not our call to make."""
     try:
         payload = _decompress(raw)
         doc = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
-    except Rejected as exc:
+    except (TooLarge, NonFinite) as exc:
         return str(exc)
-    except Exception as exc:  # malformed gzip/utf-8/json -- treat as hostile, not our bug
-        return f"unparseable: {exc}"
+    except Exception:
+        return None
     return _validate_doc(doc)
 
 
 def check_json_text(text: str) -> str | None:
     try:
         doc = json.loads(text, parse_constant=_reject_constant)
-    except Rejected as exc:
+    except NonFinite as exc:
         return str(exc)
-    except Exception as exc:
-        return f"unparseable: {exc}"
+    except Exception:
+        return None
     return _validate_doc(doc)
 
 
@@ -258,14 +267,12 @@ class BlockKillStickerHook(MethodHook):
                     if reason:
                         log(f"[Anti-Stiker] blocked {path}: {reason}")
                         args[i] = JFile(self.plugin.placeholder_path)
-                        self.plugin.notify_blocked(reason, key=path)
 
                 elif isinstance(arg, str) and '"layers"' in arg and arg.strip().startswith("{"):
                     reason = check_json_text(arg)
                     if reason:
                         log(f"[Anti-Stiker] blocked inline animation: {reason}")
                         args[i] = SAFE_PLACEHOLDER_JSON
-                        self.plugin.notify_blocked(reason, key=f"inline:{hash(arg)}")
         except Exception as exc:
             # Never let our own bug crash the thing we're trying to protect.
             log(f"[Anti-Stiker] hook error (allowing original call through): {exc}")
@@ -276,20 +283,6 @@ class AntiStikerPlugin(BasePlugin):
         super().__init__()
         self.placeholder_path = None
         self._unhooks = None
-        self._notified_keys = set()
-
-    def create_settings(self):
-        return [
-            Header(text="Anti-Stiker"),
-            Switch(
-                key="notify",
-                text="Notify when a sticker is blocked",
-                default=False,
-                subtext="Shows a one-time bulletin the first time each malicious "
-                        ".tgs is neutralized. Off by default -- blocking still "
-                        "happens silently either way.",
-            ),
-        ]
 
     def on_plugin_load(self):
         try:
@@ -321,20 +314,3 @@ class AntiStikerPlugin(BasePlugin):
                 except Exception:
                     pass
             self._unhooks = None
-
-    def notify_blocked(self, reason: str, key: str | None = None):
-        if not self.get_setting("notify", False):
-            return
-        # RLottieDrawable gets reconstructed constantly for the same file
-        # (view recycling, scrolling, cache refreshes) -- without this,
-        # blocking the same sticker once would bulletin on every rebuild.
-        if key is not None:
-            if key in self._notified_keys:
-                return
-            self._notified_keys.add(key)
-        try:
-            run_on_ui_thread(lambda: BulletinHelper.show_error(
-                f"Anti-Stiker: blocked a malicious sticker ({reason})"
-            ))
-        except Exception:
-            pass
