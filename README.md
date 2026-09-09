@@ -1,7 +1,21 @@
 # Anti-Stiker
 
 Detects and neutralizes **"kill sticker"** `.tgs` files before AyuGram (or
-any Telegram-Desktop-based client) has a chance to render them and crash.
+any Telegram-family client) has a chance to render them and crash.
+
+**Neither AyuGram Desktop nor AyuGram for Android (AyuGram4A) has a plugin
+system** — AyuGram4A explicitly excludes exteraGram's (proprietary) Python
+plugin loader, and Desktop is a compiled C++/Qt app with no runtime plugin
+API at all. So this isn't, and can't be, an installable "plugin" on either
+platform. What's here instead, for real use on Android:
+
+1. **`patches/`** — an actual source patch for AyuGram4A that fixes the bug
+   at its root (traced into their vendored `rlottie`, see
+   `patches/README.md`). This is the only way to get real protection
+   in-app; it requires rebuilding the client from source.
+2. **`antistiker/`** — a pure-Python scanner/sanitizer (stdlib only) you can
+   run **in Termux on the phone itself** to check a `.tgs` file *before*
+   opening or importing it into AyuGram, without rebuilding anything.
 
 ## What's a kill sticker?
 
@@ -25,21 +39,25 @@ counts, gzip bombs, and non-finite (`NaN`/`Infinity`) numeric literals.
   `.tgs` in manually, importing a downloaded sticker pack, or forwarding a
   file you received outside of Telegram (Downloads folder, USB stick, etc).
   This is the exact vector the local crash relies on.
-- **Doesn't**: intercept stickers received live inside a chat. AyuGram
-  (like upstream Telegram Desktop) never writes those to disk as plain
-  `.tgs` files — they go straight into its internal cache database. Doing
-  real-time in-chat interception would require a patch to AyuGram's own
-  source (see "Upstream fix" below), not an external tool.
+- **Doesn't**: intercept stickers received live inside a chat and rendered
+  automatically. There's no plugin hook to sit in front of that path on
+  either platform (see below) — closing it requires patching AyuGram's own
+  source (see "The real fix" below), not an external tool.
 
 ## Install
 
-Python 3.10+, no third-party dependencies.
+Python 3.10+, no third-party dependencies. Works the same on a desktop OS
+or in [Termux](https://termux.dev/) on Android.
 
 ```sh
 git clone <this repo>
 cd Anti-stiker
 python3 -m antistiker --version
 ```
+
+On Android (Termux): `pkg install python git`, then the same three
+commands. Point `scan`/`guard` at wherever your downloaded stickers land
+(usually `~/storage/downloads` after `termux-setup-storage`).
 
 ## Usage
 
@@ -102,14 +120,20 @@ stack) checking:
 Each file gets a verdict: `SAFE`, `SUSPICIOUS` (unusual but not dangerous,
 e.g. non-512x512 canvas), or `MALICIOUS`.
 
-## Upstream fix
+## The real fix: `patches/`
 
-The durable fix is for AyuGram/Telegram Desktop's vendored `rlottie` to
-bounds-check fields like polystar point count before using them, so this
-class of file can never reach a renderer at all — this tool is a stopgap
-that doesn't require rebuilding the client. If you build AyuGram from
-source, the fix belongs in the Lottie property parsing code, clamping
-values the same way `antistiker/sanitize.py` does here.
+The scanner is a stopgap that doesn't require rebuilding the client. The
+durable fix is for AyuGram's vendored `rlottie` to bounds-check hostile
+fields (like polystar point count) before using them, so this class of
+file can never reach the renderer at all.
+
+`patches/ayugram4a-kill-sticker-rlottie.patch` does exactly that — traced
+and verified against [AyuGram/AyuGram4A](https://github.com/AyuGram/AyuGram4A):
+the reference PoC's `"pt": 1e38` flows unchecked into a `size_t` cast in
+`vpath.cpp`'s `addPolystar()`, which evaluates to `SIZE_MAX` and blows up
+the allocation that follows. See `patches/README.md` for the full trace,
+how to apply it, and how to propose it upstream so every AyuGram4A user
+gets the fix, not just your own build.
 
 ## Tests
 
