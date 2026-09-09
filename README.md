@@ -3,19 +3,22 @@
 Detects and neutralizes **"kill sticker"** `.tgs` files before AyuGram (or
 any Telegram-family client) has a chance to render them and crash.
 
-**Neither AyuGram Desktop nor AyuGram for Android (AyuGram4A) has a plugin
-system** — AyuGram4A explicitly excludes exteraGram's (proprietary) Python
-plugin loader, and Desktop is a compiled C++/Qt app with no runtime plugin
-API at all. So this isn't, and can't be, an installable "plugin" on either
-platform. What's here instead, for real use on Android:
+**AyuGram Desktop** has no plugin system — it's a compiled C++/Qt app with
+no runtime plugin API. **AyuGram for Android (AyuGram4A)** does: it carries
+exteraGram's Python plugin engine (Chaquopy + Xposed-style method hooking),
+even though AyuGram4A's own README says it drops exteraGram's other
+proprietary features. Three things live here as a result:
 
-1. **`patches/`** — an actual source patch for AyuGram4A that fixes the bug
-   at its root (traced into their vendored `rlottie`, see
-   `patches/README.md`). This is the only way to get real protection
-   in-app; it requires rebuilding the client from source.
-2. **`antistiker/`** — a pure-Python scanner/sanitizer (stdlib only) you can
-   run **in Termux on the phone itself** to check a `.tgs` file *before*
-   opening or importing it into AyuGram, without rebuilding anything.
+1. **`android-plugin/antistiker.plugin`** — a real, installable plugin for
+   AyuGram4A/exteraGram. It hooks the exact native call that decodes a
+   `.tgs` and blocks the malicious ones *before* the decoder ever sees
+   them. See `android-plugin/README.md` to install it.
+2. **`patches/`** — a source patch for AyuGram4A that fixes the underlying
+   bug at its root, in their vendored `rlottie` (see `patches/README.md`).
+   Only useful if you build the client from source yourself.
+3. **`antistiker/`** — a pure-Python scanner/sanitizer (stdlib only) you can
+   run **in Termux on the phone itself**, or on desktop, to check a `.tgs`
+   file before opening or importing it anywhere.
 
 ## What's a kill sticker?
 
@@ -33,18 +36,25 @@ Other known variants this tool also catches: circular/deeply-nested
 precomposition references (recursion bombs), oversized layer/asset/keyframe
 counts, gzip bombs, and non-finite (`NaN`/`Infinity`) numeric literals.
 
-## What this does — and doesn't — protect
+## What protects what
 
-- **Does**: catch the file *before* you feed it to AyuGram — dragging a
-  `.tgs` in manually, importing a downloaded sticker pack, or forwarding a
-  file you received outside of Telegram (Downloads folder, USB stick, etc).
-  This is the exact vector the local crash relies on.
-- **Doesn't**: intercept stickers received live inside a chat and rendered
-  automatically. There's no plugin hook to sit in front of that path on
-  either platform (see below) — closing it requires patching AyuGram's own
-  source (see "The real fix" below), not an external tool.
+- **`android-plugin/`** catches stickers received live inside a chat too —
+  it hooks the actual decode call in AyuGram4A itself, so it doesn't matter
+  how the file got onto the device.
+- **`antistiker/`** (the scanner) only catches files *before* you feed them
+  to a client yourself — dragging a `.tgs` in manually, importing a
+  downloaded sticker pack, or forwarding a file you received outside of
+  Telegram (Downloads folder, USB stick, etc). It has no hook into any
+  client's internals, so it can't see stickers arriving live in a chat —
+  that's what the plugin (Android) or the patch (Desktop, if you build from
+  source) are for.
 
-## Install
+## Install the Android plugin
+
+See `android-plugin/README.md`. Short version: open `antistiker.plugin`
+inside AyuGram4A like any other plugin, tap Install, enable it.
+
+## Install the scanner
 
 Python 3.10+, no third-party dependencies. Works the same on a desktop OS
 or in [Termux](https://termux.dev/) on Android.
@@ -139,5 +149,6 @@ gets the fix, not just your own build.
 
 ```sh
 pip install pytest
-python3 -m pytest tests/ -v
+python3 -m pytest tests/ -v               # scanner/sanitizer
+python3 -m pytest android-plugin/tests/ -v # plugin logic, against fakes of the real SDK
 ```
